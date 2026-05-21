@@ -148,12 +148,18 @@ def load_or_build_govt_chroma(
     print(f"Read {len(ids):,} docs in {time.time() - t0:.1f}s.  Embedding & indexing...")
 
     t1 = time.time()
-    batch = 16 if granite_ef._device == "cpu" else 500
-    for i in tqdm(range(0, len(ids), batch), unit="batch", desc="indexing"):
-        collection.upsert(
-            ids       = ids  [i : i + batch],
-            documents = texts[i : i + batch],
-            metadatas = metas[i : i + batch],
-        )
+    # Chroma rejects single upserts larger than client.get_max_batch_size()
+    # (~5461 on the default SQLite backend). Below that, one call lets Chroma
+    # see the whole batch at once; above it, fall back to chunking.
+    max_batch = client.get_max_batch_size()
+    if len(ids) <= max_batch:
+        collection.upsert(ids=ids, documents=texts, metadatas=metas)
+    else:
+        for i in tqdm(range(0, len(ids), max_batch), unit="batch", desc="indexing"):
+            collection.upsert(
+                ids       = ids  [i : i + max_batch],
+                documents = texts[i : i + max_batch],
+                metadatas = metas[i : i + max_batch],
+            )
     print(f"Done. {collection.count():,} docs saved to {chroma_path} in {time.time() - t1:.1f}s.")
     return collection
