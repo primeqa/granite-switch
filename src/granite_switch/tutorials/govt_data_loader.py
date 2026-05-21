@@ -18,8 +18,8 @@ import chromadb
 import httpx
 import torch
 from chromadb import Documents, EmbeddingFunction, Embeddings
+from sentence_transformers import SentenceTransformer
 from tqdm.auto import tqdm
-from transformers import AutoModel, AutoTokenizer
 
 EMBEDDING_MODEL_ID = "ibm-granite/granite-embedding-small-english-r2"
 CHROMA_PATH        = "./govt_chroma"
@@ -32,13 +32,12 @@ TUTORIAL_DOC_IDS = ["05537c9ec2dfe15e-1362-3310", "05537c9ec2dfe15e-2-1779", "05
 class GraniteEmbeddingFunction(EmbeddingFunction):
     """ChromaDB EmbeddingFunction backed by ibm-granite/granite-embedding-*-r2."""
 
-    def __init__(self, model_id=EMBEDDING_MODEL_ID, batch_size=64, device = None):
-        if device == None:
+    def __init__(self, model_id=EMBEDDING_MODEL_ID, batch_size=64, device=None):
+        if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
-        self._device    = device
-        self._batch     = batch_size
-        self._tokenizer = AutoTokenizer.from_pretrained(model_id)
-        self._model     = AutoModel.from_pretrained(model_id).to(device).eval()
+        self._device = device
+        self._batch  = batch_size
+        self._model  = SentenceTransformer(model_id, device=device)
         print(f"Granite embedding model ready on {device}  ({model_id})")
         if device == "cpu":
             warnings.warn(
@@ -49,19 +48,12 @@ class GraniteEmbeddingFunction(EmbeddingFunction):
             )
 
     def __call__(self, input: Documents) -> Embeddings:
-        all_embs = []
-        for i in range(0, len(input), self._batch):
-            batch = list(input[i : i + self._batch])
-            enc = self._tokenizer(
-                batch, return_tensors="pt", truncation=True, max_length=512, padding=True
-            )
-            enc = {k: v.to(self._device) for k, v in enc.items()}
-            with torch.no_grad():
-                out = self._model(**enc)
-            mask = enc["attention_mask"].unsqueeze(-1).float()
-            emb  = (out.last_hidden_state * mask).sum(1) / mask.sum(1).clamp(min=1e-9)
-            all_embs.extend(emb.cpu().float().tolist())
-        return all_embs
+        return self._model.encode(
+            list(input),
+            batch_size=self._batch,
+            show_progress_bar=False,
+            convert_to_numpy=True,
+        ).tolist()
 
 
 def load_or_build_govt_chroma(
@@ -71,6 +63,8 @@ def load_or_build_govt_chroma(
     embedding_model_id=EMBEDDING_MODEL_ID,
     load_only_tutorial_docs=False,
     device=None,
+    max_docs=None,
+    embedding_fn: "EmbeddingFunction | None" = None,
 ):
     """Return a ready-to-query Chroma collection for the govt corpus.
 
@@ -81,8 +75,11 @@ def load_or_build_govt_chroma(
     ``TUTORIAL_DOC_IDS`` (the curated subset that the demo queries actually
     retrieve). Cuts the passage corpus down dramatically so first-run
     embedding takes seconds instead of minutes.
+
+    Pass ``embedding_fn`` to override the default ``GraniteEmbeddingFunction``
+    (e.g. to inject a timing-aware or alternative-backend wrapper).
     """
-    granite_ef = GraniteEmbeddingFunction(model_id=embedding_model_id, device= device)
+    granite_ef = embedding_fn or GraniteEmbeddingFunction(model_id=embedding_model_id, device=device)
     client     = chromadb.PersistentClient(path=chroma_path)
     collection = client.get_or_create_collection(
         name="govt",
@@ -140,6 +137,8 @@ def load_or_build_govt_chroma(
             ids.append(doc_id)
             texts.append(text)
             metas.append({"title": doc.get("title", ""), "url": doc.get("url", "")})
+    if max_docs is not None:
+        ids, texts, metas = ids[:max_docs], texts[:max_docs], metas[:max_docs]
     if not ids:
         raise RuntimeError(
             f"{jsonl_path} yielded zero documents - the file may be empty, truncated, "
