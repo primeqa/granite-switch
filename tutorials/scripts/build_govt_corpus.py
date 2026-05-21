@@ -6,8 +6,7 @@ size and embedding backend.
 Usage:
     python build_govt_corpus.py [--batch-size N] [--backend pytorch|onnx|openvino]
                                 [--dtype fp32|fp16|bf16] [--device cpu|cuda]
-                                [--chroma-path PATH] [--jsonl-path PATH]
-                                [--num-samples N]
+                                [--chroma-path PATH] [--jsonl-path PATH] [--full-corpus]
 """
 
 import argparse
@@ -48,6 +47,7 @@ class TimedEmbeddingFunction(EmbeddingFunction):
     length-sorted before grouping. Per-batch latency comes from a forward hook
     on the underlying transformer module (inference only — tokenization is
     not included).
+    Timing covers tokenization + model inference for each batch.
     """
 
     def __init__(self, model_id: str, batch_size: int, backend: str, device: str,
