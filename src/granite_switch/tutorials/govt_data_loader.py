@@ -127,6 +127,7 @@ def load_or_build_govt_chroma(
     max_docs=None,
     embedding_fn: "EmbeddingFunction | None" = None,
     batch_size: "int | None" = None,
+    max_length: "int | None" = 1024,
 ):
     """Return a ready-to-query Chroma collection for the govt corpus.
 
