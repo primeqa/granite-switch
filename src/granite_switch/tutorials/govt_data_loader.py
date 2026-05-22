@@ -38,6 +38,7 @@ class GraniteEmbeddingFunction(EmbeddingFunction):
         self._device = device
         self._batch  = batch_size
         self._model  = SentenceTransformer(model_id, device=device)
+        self._model.max_seq_length = 8192
         print(f"Granite embedding model ready on {device}  ({model_id})")
         if device == "cpu":
             warnings.warn(
@@ -53,6 +54,7 @@ class GraniteEmbeddingFunction(EmbeddingFunction):
             batch_size=self._batch,
             show_progress_bar=False,
             convert_to_numpy=True,
+            processing_kwargs={"text": {"max_length": 8192, "truncation": True}},
         ).tolist()
 
 
@@ -65,6 +67,7 @@ def load_or_build_govt_chroma(
     device=None,
     max_docs=None,
     embedding_fn: "EmbeddingFunction | None" = None,
+    batch_size: "int | None" = None,
 ):
     """Return a ready-to-query Chroma collection for the govt corpus.
 
@@ -149,17 +152,19 @@ def load_or_build_govt_chroma(
 
     t1 = time.time()
     # Chroma rejects single upserts larger than client.get_max_batch_size()
-    # (~5461 on the default SQLite backend). Below that, one call lets Chroma
-    # see the whole batch at once; above it, fall back to chunking.
-    max_batch = client.get_max_batch_size()
-    if len(ids) <= max_batch:
+    # (~5461 on the default SQLite backend). Honour the caller's batch_size
+    # when provided (so the embedding function sees exactly that many docs per
+    # call), but never exceed the ChromaDB hard limit.
+    chroma_max = client.get_max_batch_size()
+    chunk = min(batch_size, chroma_max) if batch_size is not None else chroma_max
+    if len(ids) <= chunk:
         collection.upsert(ids=ids, documents=texts, metadatas=metas)
     else:
-        for i in tqdm(range(0, len(ids), max_batch), unit="batch", desc="indexing"):
+        for i in tqdm(range(0, len(ids), chunk), unit="batch", desc="indexing"):
             collection.upsert(
-                ids       = ids  [i : i + max_batch],
-                documents = texts[i : i + max_batch],
-                metadatas = metas[i : i + max_batch],
+                ids       = ids  [i : i + chunk],
+                documents = texts[i : i + chunk],
+                metadatas = metas[i : i + chunk],
             )
     print(f"Done. {collection.count():,} docs saved to {chroma_path} in {time.time() - t1:.1f}s.")
     return collection
