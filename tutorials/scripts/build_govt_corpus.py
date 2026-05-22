@@ -52,14 +52,21 @@ class TimedEmbeddingFunction(EmbeddingFunction):
 
     def __init__(self, model_id: str, batch_size: int, backend: str, device: str,
                  dtype: torch.dtype = torch.float32, backend_file: str | None = None,
-                 torch_compile: bool = False):
+                 torch_compile: bool = False, max_length: int = 8192,
+                 encode_batch_size: int | None = None):
         super().__init__()
         self._model_id = model_id
         self._batch_size = batch_size
+        # encode_batch_size controls the sub-batch size passed to model.encode().
+        # Smaller values let encode()'s internal length sort spread long docs across
+        # fewer sequences, avoiding the worst-case padding where one 8k-token doc
+        # forces the whole ChromaDB chunk to pad to 8k.
+        self._encode_batch_size = encode_batch_size if encode_batch_size is not None else batch_size
         self._backend = backend
         self._dtype = dtype
         self._device = device
         self._torch_compile = torch_compile
+        self._max_length = max_length
         self._batch_latencies: list[float] = []
         self._total_docs = 0
         self._wall_start: float | None = None
@@ -97,6 +104,7 @@ class TimedEmbeddingFunction(EmbeddingFunction):
         self._model: Any = SentenceTransformer(
             model_id, backend=st_backend, device=device, model_kwargs=model_kwargs
         )
+        self._model.max_seq_length = max_length
 
         # Apply quantization in place on the inner HF model. The forward hook
         # below is registered on the SentenceTransformer Transformer wrapper, so
@@ -165,12 +173,19 @@ class TimedEmbeddingFunction(EmbeddingFunction):
         docs = list(documents)
         embs = self._model.encode(
             docs,
-            batch_size=self._batch_size,
-            show_progress_bar=True,
+            batch_size=self._encode_batch_size,
+            show_progress_bar=False,
             convert_to_numpy=True,
+            processing_kwargs={"text": {"max_length": self._max_length, "truncation": True}},
         )
         self._total_docs += len(docs)
-        return embs.tolist()
+        result = embs.tolist()
+        # SentenceTransformer returns intermediate CUDA tensors to PyTorch's
+        # allocator cache rather than back to CUDA. Flush the cache here so
+        # the next ChromaDB upsert call starts with a clean GPU budget.
+        if self._device == "cuda":
+            torch.cuda.empty_cache()
+        return result
 
     def warmup(self, documents: list[str]) -> None:
         """Run encode on `documents` and discard all timing state.
@@ -368,6 +383,16 @@ def main() -> None:
         help="Remove --chroma-path if it exists before building",
     )
     parser.add_argument(
+        "--max-length", type=int, default=8192, metavar="N",
+        help="Maximum number of tokens per passage; longer passages are truncated",
+    )
+    parser.add_argument(
+        "--encode-batch-size", type=int, default=None, metavar="N",
+        help="Sub-batch size passed to model.encode() (default: same as --batch-size). "
+             "Set smaller than --batch-size so encode()'s internal length sort can isolate "
+             "long documents and avoid padding the whole ChromaDB chunk to max-length.",
+    )
+    parser.add_argument(
         "--num-samples", type=int, default=len(TUTORIAL_DOC_IDS), metavar="N",
         help=f"Number of passages to embed; pass -1 to embed the full corpus. "
              f"For N <= {len(TUTORIAL_DOC_IDS)}, draws from the curated tutorial subset "
@@ -398,6 +423,8 @@ def main() -> None:
         dtype=dtype,
         backend_file=args.backend_file,
         torch_compile=args.torch_compile,
+        max_length=args.max_length,
+        encode_batch_size=args.encode_batch_size,
     )
 
     warmup_n = 100
@@ -427,6 +454,7 @@ def main() -> None:
         load_only_tutorial_docs=load_only_tutorial,
         max_docs=max_docs,
         embedding_fn=ef,
+        batch_size=args.batch_size,
     )
     total_time = time.perf_counter() - t_total
 

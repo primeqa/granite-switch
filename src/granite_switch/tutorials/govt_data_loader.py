@@ -30,28 +30,89 @@ TUTORIAL_DOC_IDS = ["05537c9ec2dfe15e-1362-3310", "05537c9ec2dfe15e-2-1779", "05
 
 
 class GraniteEmbeddingFunction(EmbeddingFunction):
-    """ChromaDB EmbeddingFunction backed by ibm-granite/granite-embedding-*-r2."""
+    """
+    Represents an embedding function using the Granite embedding model.
 
-    def __init__(self, model_id=EMBEDDING_MODEL_ID, batch_size=64, device=None):
+    This class is designed to compute text embeddings using the specified SentenceTransformer
+    model. It supports batch processing and can be configured to use a GPU or CPU device
+    for computation. The class is suitable for transforming input documents into their
+    corresponding embeddings, which can be used for various natural language processing
+    tasks like similarity comparison, clustering, or retrieval.
+
+    Attributes:
+        model_id (str): Identifier for the embedding model.
+        batch_size (int): Number of samples to process in a single batch.
+        max_length (int | None): Maximum length of sequences passed into the embedding
+            model. If None, defaults to 1024.
+        device (str): The computation device for embedding, either 'cuda' or 'cpu'.
+    """
+
+    def __init__(self, model_id=EMBEDDING_MODEL_ID,
+                 batch_size=64,
+                 max_length:int|None=None,
+                 device=None):
+        """
+        Initializes an instance of the class with specified configuration for embedding
+        model settings, including batch size, device, and maximum allowed sequence
+        length for processing.
+
+        Attributes:
+            model_id (str): Identifier for the embedding model.
+            batch_size (int): Number of samples to process in a single batch.1
+            max_length (int | None): Maximum sequence length for text embeddings.
+                Defaults to 1024 if not specified.
+            device (str): The computation device to use, either 'cuda' or 'cpu'.
+
+        Parameters:
+            model_id: Identifier representing the embedding model to load.
+            batch_size: Number of texts to process in batches. Default is 64.
+            max_length: An optional parameter to specify the maximum sequence length
+                for the embedding model. If None, defaults to 1024.
+            device: The device to use for computation. Defaults to 'cuda' if available,
+                otherwise 'cpu'.
+
+        Raises:
+            Warning: A runtime warning is issued if the device is set to 'cpu', as
+                performing the embedding on CPU might be significantly slower compared
+                to computation performed on a GPU.
+        """
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         self._device = device
         self._batch  = batch_size
         self._model  = SentenceTransformer(model_id, device=device)
+        if max_length is not None:
+            self._model.max_seq_length = max_length
+        else:
+            self._model.max_seq_length = 1024
         print(f"Granite embedding model ready on {device}  ({model_id})")
         if device == "cpu":
             warnings.warn(
                 "Embedding of the passages on CPU will take hours. "
-                "Expected runtime is ~10 min on a single consumer GPU. "
+                "Expected runtime is ~2 min on a single consumer GPU for this dataset. "
                 "Consider running on a GPU host, or sharing a pre-built ./govt_chroma directory.",
                 stacklevel=2,
             )
 
-    def __call__(self, input: Documents) -> Embeddings:
+    def __call__(self, documents: Documents) -> Embeddings:
+        """
+        Encodes the provided input documents into numerical embeddings using the model.
+
+        The method processes the list of documents provided, encodes them into embeddings,
+        and returns the result as a list of numerical representations suitable for further
+        machine learning applications or storage.
+
+        Args:
+            documents (Documents): A sequence of text documents to be encoded.
+
+        Returns:
+            Embeddings: A list of numerical embeddings corresponding to the input
+            documents.
+        """
         return self._model.encode(
-            list(input),
+            list(documents),
             batch_size=self._batch,
-            show_progress_bar=False,
+            show_progress_bar=True,
             convert_to_numpy=True,
         ).tolist()
 
@@ -65,6 +126,8 @@ def load_or_build_govt_chroma(
     device=None,
     max_docs=None,
     embedding_fn: "EmbeddingFunction | None" = None,
+    batch_size: "int | None" = None,
+    max_length: "int | None" = 1024,
 ):
     """Return a ready-to-query Chroma collection for the govt corpus.
 
@@ -79,7 +142,10 @@ def load_or_build_govt_chroma(
     Pass ``embedding_fn`` to override the default ``GraniteEmbeddingFunction``
     (e.g. to inject a timing-aware or alternative-backend wrapper).
     """
-    granite_ef = embedding_fn or GraniteEmbeddingFunction(model_id=embedding_model_id, device=device)
+    ef_kwargs = {"model_id": embedding_model_id, "device": device}
+    if batch_size is not None:
+        ef_kwargs["batch_size"] = batch_size
+    granite_ef = embedding_fn or GraniteEmbeddingFunction(**ef_kwargs)
     client     = chromadb.PersistentClient(path=chroma_path)
     collection = client.get_or_create_collection(
         name="govt",
@@ -149,17 +215,19 @@ def load_or_build_govt_chroma(
 
     t1 = time.time()
     # Chroma rejects single upserts larger than client.get_max_batch_size()
-    # (~5461 on the default SQLite backend). Below that, one call lets Chroma
-    # see the whole batch at once; above it, fall back to chunking.
-    max_batch = client.get_max_batch_size()
-    if len(ids) <= max_batch:
+    # (~5461 on the default SQLite backend). Honour the caller's batch_size
+    # when provided (so the embedding function sees exactly that many docs per
+    # call), but never exceed the ChromaDB hard limit.
+    chroma_max = client.get_max_batch_size()
+    chunk = min(batch_size, chroma_max) if batch_size is not None else chroma_max
+    if len(ids) <= chunk:
         collection.upsert(ids=ids, documents=texts, metadatas=metas)
     else:
-        for i in tqdm(range(0, len(ids), max_batch), unit="batch", desc="indexing"):
+        for i in tqdm(range(0, len(ids), chunk), unit="batch", desc="indexing"):
             collection.upsert(
-                ids       = ids  [i : i + max_batch],
-                documents = texts[i : i + max_batch],
-                metadatas = metas[i : i + max_batch],
+                ids       = ids  [i : i + chunk],
+                documents = texts[i : i + chunk],
+                metadatas = metas[i : i + chunk],
             )
     print(f"Done. {collection.count():,} docs saved to {chroma_path} in {time.time() - t1:.1f}s.")
     return collection
